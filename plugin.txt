@@ -1,0 +1,23 @@
+name: CasePlugin
+version: 2.0.0
+main: ru.scorpion.csaeee.CasePlugin
+api-version: 1.21
+authors: [YourName]
+description: Plugin for opening cases with animations
+website: yourwebsite.com
+commands:
+  case:
+    description: Case management commands
+    usage: /case <give|create|delete|reload|stop|blocks>
+    permission: case.admin
+  help:
+    description: Show plugin help
+    usage: /help
+    permission: case.use
+permissions:
+  case.admin:
+    description: Admin permissions for case plugin
+    default: op
+  case.use:
+    description: Permission to use cases
+    default: true

@@ -1,0 +1,741 @@
+package ru.scorpion.csaeee;
+
+import org.bukkit.*;
+import org.bukkit.block.Block;
+import org.bukkit.command.*;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
+import org.bukkit.event.*;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.event.inventory.CraftItemEvent;
+import org.bukkit.entity.ArmorStand;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.*;
+import java.util.stream.Collectors;
+
+public class CasePlugin extends JavaPlugin implements Listener {
+
+    private File casesFile;
+    private FileConfiguration casesConfig;
+    private final Map<Location, Case> cases = new HashMap<>();
+    private final Set<Location> openingCases = new HashSet<>();
+    private final Map<String, ItemStack> caseKeys = new HashMap<>();
+    private final Map<UUID, BukkitRunnable> playerAnimations = new HashMap<>();
+
+    @Override
+    public void onEnable() {
+        saveDefaultConfig();
+        loadCasesConfig();
+        registerKeys();
+        loadCases();
+        getServer().getPluginManager().registerEvents(this, this);
+    }
+
+    @Override
+    public void onDisable() {
+        playerAnimations.values().forEach(r -> { if (r != null) r.cancel(); });
+        saveCases();
+    }
+
+    private void loadCasesConfig() {
+        casesFile = new File(getDataFolder(), "cases.yml");
+        if (!casesFile.exists()) try { casesFile.createNewFile(); } catch (IOException e) {}
+        casesConfig = YamlConfiguration.loadConfiguration(casesFile);
+    }
+
+    private void registerKeys() {
+        caseKeys.clear();
+        if (!getConfig().contains("cases")) return;
+
+        getConfig().getConfigurationSection("cases").getKeys(false).forEach(caseType -> {
+            try {
+                Material material = Material.valueOf(getConfig().getString("cases." + caseType + ".key.material", "TRIPWIRE_HOOK").toUpperCase());
+                ItemStack key = new ItemStack(material);
+                ItemMeta meta = key.getItemMeta();
+                meta.setDisplayName(ChatColor.translateAlternateColorCodes('&', getConfig().getString("cases." + caseType + ".key.name", "&6Ключ")));
+
+                List<String> lore = getConfig().getStringList("cases." + caseType + ".key.lore").stream()
+                        .map(line -> ChatColor.translateAlternateColorCodes('&', line))
+                        .collect(Collectors.toList());
+                meta.setLore(lore);
+                key.setItemMeta(meta);
+                caseKeys.put(caseType, key);
+            } catch (Exception e) {}
+        });
+    }
+
+    @EventHandler
+    public void onInteract(PlayerInteractEvent e) {
+        if (e.getAction() != org.bukkit.event.block.Action.RIGHT_CLICK_BLOCK || e.getClickedBlock() == null) return;
+
+        Location loc = e.getClickedBlock().getLocation();
+        Player player = e.getPlayer();
+        ItemStack item = e.getItem();
+
+        if (cases.containsKey(loc)) {
+            e.setCancelled(true);
+            if (openingCases.contains(loc) || playerAnimations.containsKey(player.getUniqueId())) return;
+
+            String caseType = cases.get(loc).getType();
+            if (isCaseKey(item, caseType)) openCase(player, loc, caseType);
+            else player.sendMessage(ChatColor.RED + "Нужен ключ!");
+        } else if (item != null && isAnyCaseKey(item) && player.hasPermission("case.admin")) {
+            player.sendMessage(ChatColor.RED + "Используйте /case create <тип>");
+            e.setCancelled(true);
+        }
+    }
+
+    @EventHandler
+    public void onPlace(BlockPlaceEvent e) {
+        if (isAnyCaseKey(e.getItemInHand())) e.setCancelled(true);
+    }
+
+    private boolean isCaseKey(ItemStack item, String caseType) {
+        if (item == null || !item.hasItemMeta()) return false;
+        ItemStack key = caseKeys.get(caseType);
+        return key != null && Objects.equals(key.getItemMeta().getLore(), item.getItemMeta().getLore());
+    }
+
+    private boolean isAnyCaseKey(ItemStack item) {
+        return item != null && item.hasItemMeta() && caseKeys.values().stream()
+                .anyMatch(key -> Objects.equals(key.getItemMeta().getLore(), item.getItemMeta().getLore()));
+    }
+
+    private void openCase(Player player, Location loc, String caseType) {
+        if (!removeCaseKey(player, caseType)) {
+            player.sendMessage(ChatColor.RED + "Ключ не найден!");
+            return;
+        }
+
+        openingCases.add(loc);
+        ItemStack finalReward = getRandomReward(caseType);
+
+        // Получаем настройки из конфига
+        int itemCount = getConfig().getInt("animation.item_count", 6);
+        double radius = getConfig().getDouble("animation.radius", 1.5);
+        int duration = getConfig().getInt("animation.duration", 100);
+        int showTime = getConfig().getInt("animation.show_time", 60);
+        double startSpeed = getConfig().getDouble("animation.start_speed", 0.2);
+        double endSpeed = getConfig().getDouble("animation.end_speed", 0.05);
+        int slowDownStart = getConfig().getInt("animation.slow_down_start", 80);
+        double verticalAngle = getConfig().getDouble("animation.vertical_angle", 90.0); // Вертикальный поворот
+        double horizontalAngle = getConfig().getDouble("animation.horizontal_angle", 0.0); // Горизонтальный поворот
+        boolean showScreenText = getConfig().getBoolean("animation.show_screen_text", true);
+        boolean showWheel = getConfig().getBoolean("animation.show_wheel", true);
+
+        BukkitRunnable animation = new BukkitRunnable() {
+            int tick = 0;
+            List<ItemStack> items = generateAnimationItems(caseType, finalReward);
+            List<org.bukkit.entity.ArmorStand> armorStands = new ArrayList<>();
+            double totalRotation = 0;
+            boolean itemsCreated = false;
+            int rewardIndex = new Random().nextInt(itemCount);
+
+            public void run() {
+                if (tick >= duration) {
+
+                    armorStands.forEach(org.bukkit.entity.ArmorStand::remove);
+                    armorStands.clear();
+
+
+                    String caseName = ChatColor.translateAlternateColorCodes('&', getConfig().getString("cases." + caseType + ".display_name", caseType));
+                    String itemName = getItemName(finalReward);
+
+                    player.sendMessage("");
+                    player.sendMessage(ChatColor.GOLD + "=================================");
+                    player.sendMessage(ChatColor.GREEN + "🎉 ПОЗДРАВЛЯЕМ!");
+                    player.sendMessage(ChatColor.GRAY + "Кейс: " + ChatColor.WHITE + caseName);
+                    player.sendMessage(ChatColor.GRAY + "Награда: " + ChatColor.YELLOW + itemName);
+                    player.sendMessage(ChatColor.GOLD + "=================================");
+                    player.sendMessage("");
+
+
+                    if (showWheel) {
+                        org.bukkit.entity.ArmorStand rewardStand = loc.getWorld().spawn(loc.clone().add(0.5, 1.5, 0.5), org.bukkit.entity.ArmorStand.class);
+                        rewardStand.setVisible(false);
+                        rewardStand.setGravity(false);
+                        rewardStand.setInvulnerable(true);
+                        rewardStand.setSmall(true);
+                        rewardStand.setMarker(true);
+                        rewardStand.getEquipment().setHelmet(finalReward);
+
+
+                        new BukkitRunnable() {
+                            double startY = loc.getY() + 1.5;
+                            double targetY = startY + radius;
+                            int liftTicks = 0;
+                            final int totalLiftTicks = 30;
+
+                            public void run() {
+                                if (liftTicks >= totalLiftTicks) {
+                                    // Легкое покачивание наверху
+                                    new BukkitRunnable() {
+                                        int floatTicks = 0;
+                                        public void run() {
+                                            if (floatTicks >= 20) {
+                                                cancel();
+                                                return;
+                                            }
+                                            double floatY = targetY + Math.sin(floatTicks * 0.3) * 0.1;
+                                            Location floatLoc = rewardStand.getLocation().clone();
+                                            floatLoc.setY(floatY);
+                                            rewardStand.teleport(floatLoc);
+                                            floatTicks++;
+                                        }
+                                    }.runTaskTimer(CasePlugin.this, 0, 1);
+
+                                    cancel();
+                                    return;
+                                }
+
+                                double progress = (double)liftTicks / totalLiftTicks;
+
+                                double easedProgress = 1 - Math.pow(1 - progress, 3);
+                                double newY = startY + (targetY - startY) * easedProgress;
+
+                                Location currentLoc = rewardStand.getLocation().clone();
+                                currentLoc.setY(newY);
+                                rewardStand.teleport(currentLoc);
+
+                                liftTicks++;
+                            }
+                        }.runTaskTimer(CasePlugin.this, 0, 1);
+
+                        armorStands.add(rewardStand);
+                    }
+
+
+                    if (showScreenText) {
+                        showAnimation(player, caseType, finalReward, true);
+                    }
+
+
+                    new BukkitRunnable() {
+                        public void run() {
+                            finish(player, loc, caseType, finalReward);
+                            armorStands.forEach(org.bukkit.entity.ArmorStand::remove);
+                        }
+                    }.runTaskLater(CasePlugin.this, showTime);
+
+                    cancel();
+                    return;
+                }
+
+
+                double currentSpeed;
+                if (tick < slowDownStart) {
+                    currentSpeed = startSpeed;
+                } else {
+                    double progress = (double)(tick - slowDownStart) / (duration - slowDownStart);
+                    currentSpeed = startSpeed - (startSpeed - endSpeed) * (progress * progress);
+                }
+
+                totalRotation += currentSpeed;
+
+
+                if (!itemsCreated && showWheel) {
+                    itemsCreated = true;
+                    items.set(rewardIndex, finalReward);
+
+                    for (int i = 0; i < itemCount; i++) {
+                        org.bukkit.entity.ArmorStand stand = loc.getWorld().spawn(loc.clone().add(0.5, 1.5, 0.5), org.bukkit.entity.ArmorStand.class);
+                        stand.setVisible(false);
+                        stand.setGravity(false);
+                        stand.setInvulnerable(true);
+                        stand.setSmall(true);
+                        stand.setMarker(true);
+                        stand.getEquipment().setHelmet(items.get(i));
+                        armorStands.add(stand);
+                    }
+                }
+
+
+                if (itemsCreated) {
+                    double verticalRad = Math.toRadians(verticalAngle);
+                    double horizontalRad = Math.toRadians(horizontalAngle);
+
+                    for (int i = 0; i < armorStands.size(); i++) {
+                        double angle = 2 * Math.PI * i / itemCount + totalRotation;
+
+
+                        double x = radius * Math.cos(angle);
+                        double y = radius * Math.sin(angle) * Math.sin(verticalRad);
+                        double z = radius * Math.sin(angle) * Math.cos(verticalRad);
+
+
+                        double rotatedX = x * Math.cos(horizontalRad) - z * Math.sin(horizontalRad);
+                        double rotatedZ = x * Math.sin(horizontalRad) + z * Math.cos(horizontalRad);
+
+                        Location standLoc = loc.clone().add(0.5 + rotatedX, 1.5 + y, 0.5 + rotatedZ);
+                        armorStands.get(i).teleport(standLoc);
+                    }
+                }
+
+
+                if (tick % 5 == 0) {
+                    loc.getWorld().spawnParticle(Particle.END_ROD, loc.clone().add(0.5, 1.5, 0.5), 3, 0.3, 0.3, 0.3, 0.02);
+                }
+
+                if (tick % 10 == 0) {
+                    float pitch = 1.0f + (tick * 0.01f) * (float)(currentSpeed / startSpeed);
+                    loc.getWorld().playSound(loc, Sound.BLOCK_NOTE_BLOCK_BELL, 0.2f, pitch);
+                }
+
+
+                if (showScreenText && tick % 3 == 0) {
+                    int currentIndex = (int)((totalRotation * itemCount / (2 * Math.PI)) % itemCount);
+                    showAnimation(player, caseType, items.get(Math.abs(currentIndex) % items.size()), false);
+                }
+
+                tick++;
+            }
+        };
+
+        playerAnimations.put(player.getUniqueId(), animation);
+        animation.runTaskTimer(this, 0, 1);
+    }
+
+
+
+
+    private void highlightBlockBounds(Location loc, Player player) {
+        World world = loc.getWorld();
+        double x = loc.getX();
+        double y = loc.getY();
+        double z = loc.getZ();
+
+
+        for (double dx = 0; dx <= 1; dx += 0.2) {
+            for (double dz = 0; dz <= 1; dz += 0.2) {
+                world.spawnParticle(Particle.SMOKE, x + dx, y + 1, z + dz, 1,
+                        new Particle.DustOptions(Color.fromRGB(0, 255, 0), 1));
+            }
+        }
+
+
+        for (double dx = 0; dx <= 1; dx += 0.2) {
+            for (double dz = 0; dz <= 1; dz += 0.2) {
+                world.spawnParticle(Particle.SMOKE, x + dx, y, z + dz, 1,
+                        new Particle.DustOptions(Color.fromRGB(0, 255, 0), 1));
+            }
+        }
+
+
+        for (double dy = 0; dy <= 1; dy += 0.2) {
+            for (double dz = 0; dz <= 1; dz += 0.2) {
+                world.spawnParticle(Particle.SMOKE, x, y + dy, z + dz, 1,
+                        new Particle.DustOptions(Color.fromRGB(0, 255, 0), 1));
+                world.spawnParticle(Particle.SMOKE, x + 1, y + dy, z + dz, 1,
+                        new Particle.DustOptions(Color.fromRGB(0, 255, 0), 1));
+            }
+            for (double dx = 0; dx <= 1; dx += 0.2) {
+                world.spawnParticle(Particle.SMOKE, x + dx, y + dy, z, 1,
+                        new Particle.DustOptions(Color.fromRGB(0, 255, 0), 1));
+                world.spawnParticle(Particle.SMOKE, x + dx, y + dy, z + 1, 1,
+                        new Particle.DustOptions(Color.fromRGB(0, 255, 0), 1));
+            }
+        }
+    }
+
+    @EventHandler
+    public void onCraft(org.bukkit.event.inventory.CraftItemEvent e) {
+        for (ItemStack item : e.getInventory().getMatrix()) {
+            if (item != null && isAnyCaseKey(item)) {
+                e.setCancelled(true);
+                return;
+            }
+        }
+    }
+
+
+
+    private List<ItemStack> generateAnimationItems(String caseType, ItemStack reward) {
+        List<ItemStack> items = new ArrayList<>();
+        List<Map<?, ?>> rewards = getConfig().getMapList("cases." + caseType + ".rewards");
+        Random random = new Random();
+
+        for (int i = 0; i < 20 && !rewards.isEmpty(); i++) {
+            Map<?, ?> r = rewards.get(random.nextInt(rewards.size()));
+            try {
+                Material m = Material.valueOf(((String) r.get("material")).toUpperCase());
+                ItemStack item = new ItemStack(m, r.containsKey("amount") ? (Integer) r.get("amount") : 1);
+                if (r.containsKey("name")) {
+                    ItemMeta meta = item.getItemMeta();
+                    meta.setDisplayName(ChatColor.translateAlternateColorCodes('&', (String) r.get("name")));
+                    item.setItemMeta(meta);
+                }
+                items.add(item);
+            } catch (Exception e) {}
+        }
+
+        items.add(reward);
+        Collections.shuffle(items);
+        return items;
+    }
+
+
+
+    private final Map<Location, Integer> caseNumbers = new HashMap<>();
+    private int nextCaseNumber = 1;
+
+    private void showAnimation(Player player, String caseType, ItemStack item, boolean isFinal) {
+        if (!getConfig().getBoolean("animation.show_screen_text", true)) return;
+
+        String caseName = ChatColor.translateAlternateColorCodes('&', getConfig().getString("cases." + caseType + ".display_name", caseType));
+        String itemName = getItemName(item);
+
+        int showTime = getConfig().getInt("animation.show_time", 60);
+
+        player.sendTitle(isFinal ? ChatColor.GREEN + "🎉 ПОЗДРАВЛЯЕМ!" : caseName,
+                caseName + "\n" + ChatColor.YELLOW + itemName,
+                0, isFinal ? showTime : 21, isFinal ? 20 : 0);
+
+        if (!isFinal) player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_HAT, 0.1f, 1.0f);
+    }
+
+    private String getItemName(ItemStack item) {
+        if (item.hasItemMeta() && item.getItemMeta().hasDisplayName()) {
+            return item.getItemMeta().getDisplayName();
+        }
+        return Arrays.stream(item.getType().toString().toLowerCase().split("_"))
+                .map(word -> Character.toUpperCase(word.charAt(0)) + word.substring(1))
+                .collect(Collectors.joining(" "));
+    }
+
+    private void finish(Player player, Location loc, String caseType, ItemStack reward) {
+        openingCases.remove(loc);
+        BukkitRunnable animation = playerAnimations.remove(player.getUniqueId());
+        if (animation != null) animation.cancel();
+
+        showAnimation(player, caseType, reward, true);
+
+        // Исправляем выдачу награды
+        HashMap<Integer, ItemStack> leftover = player.getInventory().addItem(reward.clone());
+        if (!leftover.isEmpty()) {
+            for (ItemStack left : leftover.values()) {
+                loc.getWorld().dropItemNaturally(loc, left);
+            }
+        }
+
+        loc.getWorld().playSound(loc, Sound.ENTITY_PLAYER_LEVELUP, 1, 1);
+        loc.getWorld().spawnParticle(Particle.FIREWORK, loc.clone().add(0.5, 1, 0.5), 30, 0.5, 0.5, 0.5, 0.2);
+    }
+
+    private boolean removeCaseKey(Player player, String caseType) {
+        for (int i = 0; i < player.getInventory().getSize(); i++) {
+            ItemStack item = player.getInventory().getItem(i);
+            if (isCaseKey(item, caseType)) {
+                if (item.getAmount() > 1) item.setAmount(item.getAmount() - 1);
+                else player.getInventory().setItem(i, null);
+                return true;
+            }
+        }
+        return false;
+    }
+
+
+    private ItemStack getRandomReward(String caseType) {
+        List<Map<?, ?>> items = getConfig().getMapList("cases." + caseType + ".rewards");
+        if (items.isEmpty()) return new ItemStack(Material.DIAMOND, 1);
+
+        double total = items.stream().mapToDouble(i -> (Double) i.get("weight")).sum();
+        double random = Math.random() * total;
+        double current = 0;
+
+        for (Map<?, ?> item : items) {
+            current += (Double) item.get("weight");
+            if (random <= current) {
+                try {
+                    if (item.containsKey("key_type")) return caseKeys.get(item.get("key_type")).clone();
+
+                    Material m = Material.valueOf(((String) item.get("material")).toUpperCase());
+                    ItemStack reward = new ItemStack(m, (Integer) item.get("amount"));
+                    ItemMeta meta = reward.getItemMeta();
+
+                    // Устанавливаем название если есть
+                    if (item.containsKey("name")) {
+                        meta.setDisplayName(ChatColor.translateAlternateColorCodes('&', (String) item.get("name")));
+                    }
+
+                    // ДОБАВЛЯЕМ ЗАЧАРОВАНИЯ ЕСЛИ ЕСТЬ В КОНФИГЕ
+                    if (item.containsKey("enchants")) {
+                        Map<?, ?> enchants = (Map<?, ?>) item.get("enchants");
+                        for (Map.Entry<?, ?> enchantEntry : enchants.entrySet()) {
+                            String enchantName = (String) enchantEntry.getKey();
+                            int level = (Integer) enchantEntry.getValue();
+
+                            try {
+                                org.bukkit.enchantments.Enchantment enchant = org.bukkit.enchantments.Enchantment.getByName(enchantName.toUpperCase());
+                                if (enchant != null) {
+                                    meta.addEnchant(enchant, level, true);
+                                }
+                            } catch (Exception e) {
+                                getLogger().warning("Неизвестное зачарование: " + enchantName);
+                            }
+                        }
+                    }
+
+                    reward.setItemMeta(meta);
+                    return reward;
+
+                } catch (Exception e) {}
+            }
+        }
+        return new ItemStack(Material.DIAMOND, 1);
+    }
+
+    private void loadCases() {
+        cases.clear();
+        caseNumbers.clear();
+        nextCaseNumber = 1;
+
+        casesConfig.getKeys(false).forEach(key -> {
+            try {
+                String[] p = key.split(";");
+                World w = getServer().getWorld(p[0]);
+                if (w != null) {
+                    Location loc = new Location(w, Integer.parseInt(p[1]), Integer.parseInt(p[2]), Integer.parseInt(p[3]));
+                    String type = casesConfig.getString(key + ".type", "common");
+                    cases.put(loc, new Case(type));
+                    caseNumbers.put(loc, nextCaseNumber++);
+                }
+            } catch (Exception e) {}
+        });
+    }
+
+    private void saveCases() {
+        try {
+            casesConfig = new YamlConfiguration();
+            cases.forEach((loc, c) -> casesConfig.set(loc.getWorld().getName() + ";" + loc.getBlockX() + ";" + loc.getBlockY() + ";" + loc.getBlockZ() + ".type", c.type));
+            casesConfig.save(casesFile);
+        } catch (IOException e) {}
+    }
+
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
+        if (!(sender instanceof Player p)) return true;
+
+        if (args.length == 0) {
+            p.sendMessage(ChatColor.YELLOW + "/case give, create, delete, list, reload, stop");
+            return true;
+        }
+
+        switch (args[0]) {
+            case "give":
+                if (args.length < 2 || !caseKeys.containsKey(args[1])) return true;
+                int amt = args.length > 2 ? Math.min(64, Math.max(1, Integer.parseInt(args[2]))) : 1;
+                ItemStack k = caseKeys.get(args[1]).clone();
+                k.setAmount(amt);
+                p.getInventory().addItem(k);
+                p.sendMessage(ChatColor.GREEN + "Ключей: " + amt);
+                break;
+
+            case "tp":
+                if (args.length < 2) {
+                    p.sendMessage(ChatColor.RED + "Использование: /case tp <номер>");
+                    return true;
+                }
+
+                try {
+                    int targetNumber = Integer.parseInt(args[1]);
+                    Location targetLoc = null;
+
+                    // Ищем кейс по номеру
+                    for (Map.Entry<Location, Integer> entry : caseNumbers.entrySet()) {
+                        if (entry.getValue() == targetNumber) {
+                            targetLoc = entry.getKey();
+                            break;
+                        }
+                    }
+
+                    if (targetLoc == null) {
+                        p.sendMessage(ChatColor.RED + "Кейс с номером " + targetNumber + " не найден!");
+                        return true;
+                    }
+
+                    // Телепортируем игрока
+                    p.teleport(targetLoc.clone().add(0.5, 1, 0.5));
+                    p.sendMessage(ChatColor.GREEN + "Телепортирован к кейсу #" + targetNumber + " (" + cases.get(targetLoc).getType() + ")");
+
+                    // Подсвечиваем кейс на 5 секунд
+                    String particleName = getConfig().getString("highlight.particle", "VILLAGER_HAPPY");
+                    try {
+                        Particle particle = Particle.valueOf(particleName.toUpperCase());
+                        Location finalTargetLoc = targetLoc;
+                        new BukkitRunnable() {
+                            int ticks = 0;
+                            public void run() {
+                                if (ticks >= 100) { // 5 секунд
+                                    cancel();
+                                    return;
+                                }
+                                finalTargetLoc.getWorld().spawnParticle(particle, finalTargetLoc.clone().add(0.5, 1, 0.5), 10, 0.3, 0.5, 0.3, 0.1);
+                                ticks++;
+                            }
+                        }.runTaskTimer(this, 0, 1);
+                    } catch (Exception e) {
+                        p.sendMessage(ChatColor.RED + "Ошибка частицы: " + particleName);
+                    }
+
+                } catch (NumberFormatException e) {
+                    p.sendMessage(ChatColor.RED + "Неверный номер кейса!");
+                }
+                break;
+
+            case "create":
+                Block b = p.getTargetBlockExact(10);
+                if (b == null) {
+                    p.sendMessage(ChatColor.RED + "Смотрите на блок!");
+                    return true;
+                }
+                Location loc = b.getLocation();
+                if (cases.containsKey(loc)) {
+                    p.sendMessage(ChatColor.RED + "Здесь уже есть кейс!");
+                    return true;
+                }
+                cases.put(loc, new Case(args[1]));
+                caseNumbers.put(loc, nextCaseNumber++);
+                saveCases();
+                p.sendMessage(ChatColor.GREEN + "Кейс создан! Номер: " + caseNumbers.get(loc));
+                break;
+
+
+
+
+            case "list":
+                p.sendMessage(ChatColor.YELLOW + "Кейсов: " + cases.size());
+                cases.forEach((location, caseObj) -> {
+                    int number = caseNumbers.get(location);
+                    String info = ChatColor.GRAY + "#" + number + " " + ChatColor.WHITE +
+                            location.getWorld().getName() + " " +
+                            location.getBlockX() + " " +
+                            location.getBlockY() + " " +
+                            location.getBlockZ() + ChatColor.GRAY + " → " +
+                            ChatColor.YELLOW + caseObj.getType();
+                    p.sendMessage(info);
+                });
+
+                // ПОДСВЕТКА КЕЙСОВ С НАСТРОЙКАМИ ИЗ КОНФИГА
+                String particleName = getConfig().getString("highlight.particle", "VILLAGER_HAPPY");
+                int duration = getConfig().getInt("highlight.duration", 10) * 20;
+                int count = getConfig().getInt("highlight.count", 5);
+
+                try {
+                    Particle particle = Particle.valueOf(particleName.toUpperCase());
+
+                    new BukkitRunnable() {
+                        int ticks = 0;
+                        public void run() {
+                            if (ticks >= duration) {
+                                cancel();
+                                return;
+                            }
+
+                            if (ticks % 20 == 0) {
+                                cases.forEach((location, caseObj) -> {
+                                    location.getWorld().spawnParticle(particle, location.clone().add(0.5, 1, 0.5), count, 0.2, 0.3, 0.2, 0.05);
+                                });
+                            }
+                            ticks++;
+                        }
+                    }.runTaskTimer(this, 0, 1);
+                } catch (Exception e) {
+                    p.sendMessage(ChatColor.RED + "Ошибка частицы: " + particleName);
+                }
+                break;
+
+
+            case "delete":
+                Block t = p.getTargetBlockExact(10);
+                if (t == null || !cases.containsKey(t.getLocation())) return true;
+                cases.remove(t.getLocation());
+                caseNumbers.remove(t.getLocation());
+                // Пересчитываем номера
+                reassignCaseNumbers();
+                saveCases();
+                p.sendMessage(ChatColor.GREEN + "Кейс удален!");
+                break;
+
+
+            case "reload":
+                reloadConfig();
+                registerKeys();
+                loadCases(); // ПЕРЕЗАГРУЖАЕМ КЕЙСЫ ИЗ ФАЙЛА
+                reassignCaseNumbers(); // ПЕРЕСЧИТЫВАЕМ НОМЕРА
+                p.sendMessage(ChatColor.GREEN + "Конфиг перезагружен! Кейсов: " + cases.size());
+                break;
+
+            case "stop":
+                BukkitRunnable a = playerAnimations.remove(p.getUniqueId());
+                if (a != null) a.cancel();
+                p.sendTitle("", "", 0, 1, 0);
+                break;
+        }
+        return true;
+    }
+
+    private void reassignCaseNumbers() {
+        caseNumbers.clear();
+        nextCaseNumber = 1;
+        cases.keySet().forEach(loc -> caseNumbers.put(loc, nextCaseNumber++));
+    }
+
+    private void highlightBlock(Player player, Location location) {
+        double x = location.getX();
+        double y = location.getY();
+        double z = location.getZ(); 
+
+        // Создаем частицы по углам блока
+        Particle.DustOptions dust = new Particle.DustOptions(Color.fromRGB(0, 255, 0), 1);
+
+        // Верхняя плоскость
+        for (double dx = 0; dx <= 1; dx += 0.2) {
+            for (double dz = 0; dz <= 1; dz += 0.2) {
+                player.spawnParticle(Particle.SMOKE, x + dx, y + 1, z + dz, 1, dust);
+            }
+        }
+
+        // Нижняя плоскость
+        for (double dx = 0; dx <= 1; dx += 0.2) {
+            for (double dz = 0; dz <= 1; dz += 0.2) {
+                player.spawnParticle(Particle.SMOKE, x + dx, y, z + dz, 1, dust);
+            }
+        }
+
+        // Вертикальные линии
+        for (double dy = 0; dy <= 1; dy += 0.2) {
+            player.spawnParticle(Particle.SMOKE, x, y + dy, z, 1, dust);
+            player.spawnParticle(Particle.SMOKE, x + 1, y + dy, z, 1, dust);
+            player.spawnParticle(Particle.SMOKE, x, y + dy, z + 1, 1, dust);
+            player.spawnParticle(Particle.SMOKE, x + 1, y + dy, z + 1, 1, dust);
+        }
+    }
+
+
+    @Override
+    public List<String> onTabComplete(CommandSender sender, Command cmd, String alias, String[] args) {
+        if (args.length == 1) return Arrays.asList("give", "create", "delete", "list", "reload", "stop", "tp");
+        if (args.length == 2 && (args[0].equals("give") || args[0].equals("create")))
+            return new ArrayList<>(caseKeys.keySet());
+        if (args.length == 2 && args[0].equals("tp"))
+            return caseNumbers.values().stream().map(String::valueOf).collect(Collectors.toList());
+        if (args.length == 3 && args[0].equals("give"))
+            return Arrays.asList("1", "5", "10", "16");
+        return new ArrayList<>();
+    }
+
+    private static class Case {
+        final String type;
+        Case(String type) { this.type = type; }
+        String getType() { return type; }
+    }
+}
